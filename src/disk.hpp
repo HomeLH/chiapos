@@ -24,6 +24,10 @@
 #include <chrono>
 
 #ifndef _WIN32
+#include <fcntl.h>
+#endif
+
+#ifndef _WIN32
 #include <sys/mman.h>
 #define USE_MMAP
 #endif
@@ -51,6 +55,73 @@ struct Disk {
     virtual void FreeMemory() = 0;
     virtual ~Disk() = default;
 };
+
+bool hasEnding(std::string const& fullString, std::string const& ending)
+{
+    if (fullString.length() >= ending.length()) {
+        return (0 == fullString.compare(fullString.length() - ending.length(), ending.length(), ending));
+    }
+    else {
+        return false;
+    }
+}
+
+#ifdef _WIN32
+static LARGE_INTEGER toLargeInteger(long long value)
+{
+    LARGE_INTEGER result;
+
+#ifdef INT64_MAX // Does the compiler natively support 64-bit integers?
+    result.QuadPart = value;
+#else
+    result.high_part = value & 0xFFFFFFFF00000000;
+    result.low_part = value & 0xFFFFFFFF;
+#endif
+    return result;
+}
+
+void allocate(FILE* file, std::string filename)
+{
+    HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));
+    if (hFile != INVALID_HANDLE_VALUE) {
+        FILE_ALLOCATION_INFO fai;
+        std::cout << "filename is " << filename << std::endl;
+        if (hasEnding(filename, "plot.tmp") || hasEnding(filename, "plot.2.tmp") || hasEnding(filename, "plot")) {
+            // apparently there is a limit of 2 GB
+            std::cout << "allocating <2GB" << std::endl;
+            fai.AllocationSize = toLargeInteger(2 * 1000L * 1024L * 1024L); // plot.tmp
+        }
+        else if (hasEnding(filename, "plot.table1.tmp") || hasEnding(filename, "plot.table2.tmp") || hasEnding(filename, "plot.table3.tmp") || hasEnding(filename, "plot.table4.tmp") || hasEnding(filename, "plot.table5.tmp") || hasEnding(filename, "plot.table6.tmp") || hasEnding(filename, "plot.table7.tmp")) {
+            std::cout << "allocating <2GB" << std::endl;
+            fai.AllocationSize = toLargeInteger(2 * 1000L * 1024L * 1024L); // plot.table7.tmp
+        }
+        else if (hasEnding(filename, "sort.tmp")) {
+            std::cout << "allocating 400MB" << std::endl;
+            fai.AllocationSize = toLargeInteger(400L * 1024L * 1024L); // sort.tmp
+        }
+        else {
+            std::cout << "allocating 400MB" << std::endl;
+            fai.AllocationSize = toLargeInteger(400L * 1024L * 1024L); // sort_bucket_084.tmp
+        }
+
+        BOOL fResult = SetFileInformationByHandle(hFile,
+            FileAllocationInfo,
+            &fai,
+            sizeof(FILE_ALLOCATION_INFO));
+
+        if (fResult) {
+            std::cout << "allocation worked" << std::endl;
+        }
+        else {
+            // error code 87 appears when allocation size more than 2GB above file size. No other error appeared so far
+            std::cout << "allocation error: '" << GetLastError() << "' continuing without" << std::endl;
+        }
+    }
+    else {
+        throw std::invalid_argument("invalid file handle (_get_osfhandle _fileno failed?)");
+    }
+}
+#endif
 
 #if ENABLE_LOGGING
 // logging is currently unix / bsd only: use <fstream> or update
@@ -118,8 +189,22 @@ struct FileDisk {
         do {
 #ifdef _WIN32
             f_ = ::_wfopen(filename_.c_str(), (flags & writeFlag) ? L"w+b" : L"r+b");
+            // allocate only windows
+            if ((flags & writeFlag)) {
+                allocate(f_, filename_.string());
+            }
 #else
             f_ = ::fopen(filename_.c_str(), (flags & writeFlag) ? "w+b" : "r+b");
+            // Preallocate, only linux
+            if ((flags & writeFlag) && hasEnding(filename_, "sort.tmp")) {
+                int fd = fileno(f_);
+                int64_t length = 300L * 1024L * 1024L;
+                int offset = 0;
+                int r = fallocate(fd, 0, offset, length);
+                if (r == -1) {
+                    std::cout << "\tfallocate failed,  errno " << errno << std::endl;
+                }
+            }
 
     #ifdef USE_MMAP
             // mmap
