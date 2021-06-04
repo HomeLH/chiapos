@@ -23,6 +23,15 @@
 #include <thread>
 #include <chrono>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#define USE_MMAP
+#endif
+
 // enables disk I/O logging to disk.log
 // use tools/disk.gnuplot to generate a plot
 #define ENABLE_LOGGING 0
@@ -46,6 +55,73 @@ struct Disk {
     virtual void FreeMemory() = 0;
     virtual ~Disk() = default;
 };
+
+bool hasEnding(std::string const& fullString, std::string const& ending)
+{
+    if (fullString.length() >= ending.length()) {
+        return (0 == fullString.compare(fullString.length() - ending.length(), ending.length(), ending));
+    }
+    else {
+        return false;
+    }
+}
+
+#ifdef _WIN32
+static LARGE_INTEGER toLargeInteger(long long value)
+{
+    LARGE_INTEGER result;
+
+#ifdef INT64_MAX // Does the compiler natively support 64-bit integers?
+    result.QuadPart = value;
+#else
+    result.high_part = value & 0xFFFFFFFF00000000;
+    result.low_part = value & 0xFFFFFFFF;
+#endif
+    return result;
+}
+
+void allocate(FILE* file, std::string filename)
+{
+    HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));
+    if (hFile != INVALID_HANDLE_VALUE) {
+        FILE_ALLOCATION_INFO fai;
+        std::cout << "filename is " << filename << std::endl;
+        if (hasEnding(filename, "plot.tmp") || hasEnding(filename, "plot.2.tmp") || hasEnding(filename, "plot")) {
+            // apparently there is a limit of 2 GB
+            std::cout << "allocating <2GB" << std::endl;
+            fai.AllocationSize = toLargeInteger(2 * 1000L * 1024L * 1024L); // plot.tmp
+        }
+        else if (hasEnding(filename, "plot.table1.tmp") || hasEnding(filename, "plot.table2.tmp") || hasEnding(filename, "plot.table3.tmp") || hasEnding(filename, "plot.table4.tmp") || hasEnding(filename, "plot.table5.tmp") || hasEnding(filename, "plot.table6.tmp") || hasEnding(filename, "plot.table7.tmp")) {
+            std::cout << "allocating <2GB" << std::endl;
+            fai.AllocationSize = toLargeInteger(2 * 1000L * 1024L * 1024L); // plot.table7.tmp
+        }
+        else if (hasEnding(filename, "sort.tmp")) {
+            std::cout << "allocating 400MB" << std::endl;
+            fai.AllocationSize = toLargeInteger(400L * 1024L * 1024L); // sort.tmp
+        }
+        else {
+            std::cout << "allocating 400MB" << std::endl;
+            fai.AllocationSize = toLargeInteger(400L * 1024L * 1024L); // sort_bucket_084.tmp
+        }
+
+        BOOL fResult = SetFileInformationByHandle(hFile,
+            FileAllocationInfo,
+            &fai,
+            sizeof(FILE_ALLOCATION_INFO));
+
+        if (fResult) {
+            std::cout << "allocation worked" << std::endl;
+        }
+        else {
+            // error code 87 appears when allocation size more than 2GB above file size. No other error appeared so far
+            std::cout << "allocation error: '" << GetLastError() << "' continuing without" << std::endl;
+        }
+    }
+    else {
+        throw std::invalid_argument("invalid file handle (_get_osfhandle _fileno failed?)");
+    }
+}
+#endif
 
 #if ENABLE_LOGGING
 // logging is currently unix / bsd only: use <fstream> or update
@@ -113,8 +189,39 @@ struct FileDisk {
         do {
 #ifdef _WIN32
             f_ = ::_wfopen(filename_.c_str(), (flags & writeFlag) ? L"w+b" : L"r+b");
+            // allocate only windows
+            if ((flags & writeFlag)) {
+                allocate(f_, filename_.string());
+            }
 #else
             f_ = ::fopen(filename_.c_str(), (flags & writeFlag) ? "w+b" : "r+b");
+            // Preallocate, only linux
+            if ((flags & writeFlag) && hasEnding(filename_, "sort.tmp")) {
+                int fd = fileno(f_);
+                int64_t length = 300L * 1024L * 1024L;
+                int offset = 0;
+                int r = fallocate(fd, 0, offset, length);
+                if (r == -1) {
+                    std::cout << "\tfallocate failed,  errno " << errno << std::endl;
+                }
+            }
+
+    #ifdef USE_MMAP
+            // mmap
+            if (map_ == nullptr) {
+                ::fseek(f_, 0L, SEEK_END);
+                map_length_ = ::ftell(f_);
+                ::fseek(f_, 0L, SEEK_SET);
+                if (map_length_) {
+                    if ((map_ = (char *)mmap(NULL, map_length_, PROT_READ, MAP_PRIVATE, ::fileno(f_), 0)) == MAP_FAILED) {
+                        std::cout << "\tmap failed,  errno " << errno << std::endl;
+                        map_ = nullptr;
+                    } else {
+                        std::cout << "\tmap file " << filename_.c_str() << "length " << map_length_ << std::endl;
+                    }
+                }
+            }
+    #endif
 #endif
             if (f_ == nullptr) {
                 std::string error_message =
@@ -142,6 +249,16 @@ struct FileDisk {
     void Close()
     {
         if (f_ == nullptr) return;
+
+    #ifndef _WIN32
+    #ifdef USE_MMAP
+        if (map_) {
+            if (munmap(map_, map_length_) != 0)
+                std::cout << "munmap failed, file " << filename_.c_str() << std::endl;
+        }
+    #endif
+    #endif
+
         ::fclose(f_);
         f_ = nullptr;
         readPos = 0;
@@ -156,6 +273,16 @@ struct FileDisk {
 #if ENABLE_LOGGING
         disk_log(filename_, op_t::read, begin, length);
 #endif
+
+    #ifndef _WIN32
+    #ifdef USE_MMAP
+        if (map_ != nullptr) {
+            memcpy(memcache, map_ + begin, length);
+            return ;
+        } 
+    #endif
+    #endif
+
         // Seek, read, and replace into memcache
         uint64_t amtread;
         do {
@@ -169,6 +296,7 @@ struct FileDisk {
 #endif
                 bReading = true;
             }
+    
             amtread = ::fread(reinterpret_cast<char *>(memcache), sizeof(uint8_t), length, f_);
             readPos = begin + amtread;
             if (amtread != length) {
@@ -243,6 +371,13 @@ struct FileDisk {
         fs::resize_file(filename_, new_size);
     }
 
+#ifndef _WIN32
+#ifdef USE_MMAP
+    char *map_ = nullptr;
+    size_t map_length_;
+#endif
+#endif
+
 private:
 
     uint64_t readPos = 0;
@@ -252,6 +387,7 @@ private:
 
     fs::path filename_;
     FILE *f_ = nullptr;
+
 
     static const uint8_t writeFlag = 0b01;
     static const uint8_t retryOpenFlag = 0b10;
@@ -263,6 +399,18 @@ struct BufferedDisk : Disk
 
     uint8_t const* Read(uint64_t begin, uint64_t length) override
     {
+#ifndef _WIN32
+#ifdef USE_MMAP
+        if (disk_->map_ == nullptr)
+            disk_->Open(0b10); // retryOpenFlag
+        
+        if (disk_->map_)
+            return (uint8_t const*) disk_->map_ + begin;
+        else
+            std::cout << "\tread in buffer" << std::endl;
+#endif
+#endif
+
         assert(length < read_ahead);
         NeedReadCache();
         // all allocations need 7 bytes head-room, since
